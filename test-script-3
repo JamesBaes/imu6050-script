@@ -1,0 +1,385 @@
+import smbus2
+import time
+import numpy as np
+from collections import deque
+from dataclasses import dataclass
+from typing import Tuple
+
+@dataclass
+class Vector3D:
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+    
+    def __add__(self, other):
+        return Vector3D(self.x + other.x, self.y + other.y, self.z + other.z)
+    
+    def __mul__(self, scalar):
+        return Vector3D(self.x * scalar, self.y * scalar, self.z * scalar)
+    
+    def magnitude(self):
+        return np.sqrt(self.x**2 + self.y**2 + self.z**2)
+    
+    def to_array(self):
+        return np.array([self.x, self.y, self.z])
+
+class MPU6050:
+    """MPU6050 IMU interface"""
+    
+    # MPU6050 Registers
+    PWR_MGMT_1 = 0x6B
+    ACCEL_XOUT_H = 0x3B
+    GYRO_XOUT_H = 0x43
+    
+    # Sensitivity scales
+    ACCEL_SCALE = 16384.0  # for ±2g range
+    GYRO_SCALE = 131.0     # for ±250°/s range
+    
+    def __init__(self, bus_num=1, address=0x68):
+        self.bus = smbus2.SMBus(bus_num)
+        self.address = address
+        self._initialize()
+    
+    def _initialize(self):
+        """Wake up MPU6050 and configure"""
+        self.bus.write_byte_data(self.address, self.PWR_MGMT_1, 0)
+        time.sleep(0.1)
+    
+    def read_raw_data(self, reg):
+        """Read 16-bit signed data from register"""
+        high = self.bus.read_byte_data(self.address, reg)
+        low = self.bus.read_byte_data(self.address, reg + 1)
+        value = (high << 8) | low
+        if value > 32768:
+            value -= 65536
+        return value
+    
+    def read_accel(self) -> Vector3D:
+        """Read accelerometer data in g units"""
+        ax = self.read_raw_data(self.ACCEL_XOUT_H) / self.ACCEL_SCALE
+        ay = self.read_raw_data(self.ACCEL_XOUT_H + 2) / self.ACCEL_SCALE
+        az = self.read_raw_data(self.ACCEL_XOUT_H + 4) / self.ACCEL_SCALE
+        return Vector3D(ax, ay, az)
+    
+    def read_gyro(self) -> Vector3D:
+        """Read gyroscope data in degrees/s"""
+        gx = self.read_raw_data(self.GYRO_XOUT_H) / self.GYRO_SCALE
+        gy = self.read_raw_data(self.GYRO_XOUT_H + 2) / self.GYRO_SCALE
+        gz = self.read_raw_data(self.GYRO_XOUT_H + 4) / self.GYRO_SCALE
+        return Vector3D(gx, gy, gz)
+
+class ComplementaryFilter:
+    """Complementary filter for sensor fusion"""
+    
+    def __init__(self, alpha=0.98):
+        self.alpha = alpha
+        self.angle = Vector3D()
+    
+    def update(self, accel: Vector3D, gyro: Vector3D, dt: float) -> Vector3D:
+        """Fuse accelerometer and gyroscope data"""
+        # Gyroscope integration
+        self.angle.x += gyro.x * dt
+        self.angle.y += gyro.y * dt
+        self.angle.z += gyro.z * dt
+        
+        # Accelerometer angles
+        accel_angle_x = np.arctan2(accel.y, np.sqrt(accel.x**2 + accel.z**2)) * 180/np.pi
+        accel_angle_y = np.arctan2(-accel.x, np.sqrt(accel.y**2 + accel.z**2)) * 180/np.pi
+        
+        # Complementary filter
+        self.angle.x = self.alpha * self.angle.x + (1 - self.alpha) * accel_angle_x
+        self.angle.y = self.alpha * self.angle.y + (1 - self.alpha) * accel_angle_y
+        
+        return self.angle
+
+class KalmanFilter:
+    """1D Kalman filter for noise reduction"""
+    
+    def __init__(self, process_variance=1e-3, measurement_variance=1e-1):
+        self.process_variance = process_variance
+        self.measurement_variance = measurement_variance
+        self.estimate = 0.0
+        self.estimate_error = 1.0
+    
+    def update(self, measurement: float) -> float:
+        """Update filter with new measurement"""
+        # Prediction
+        prediction_error = self.estimate_error + self.process_variance
+        
+        # Update
+        kalman_gain = prediction_error / (prediction_error + self.measurement_variance)
+        self.estimate = self.estimate + kalman_gain * (measurement - self.estimate)
+        self.estimate_error = (1 - kalman_gain) * prediction_error
+        
+        return self.estimate
+
+class MovingAverageFilter:
+    """Moving average filter for smoothing"""
+    
+    def __init__(self, window_size=10):
+        self.window_size = window_size
+        self.data_x = deque(maxlen=window_size)
+        self.data_y = deque(maxlen=window_size)
+        self.data_z = deque(maxlen=window_size)
+    
+    def update(self, vec: Vector3D) -> Vector3D:
+        """Add new data and return filtered value"""
+        self.data_x.append(vec.x)
+        self.data_y.append(vec.y)
+        self.data_z.append(vec.z)
+        
+        return Vector3D(
+            sum(self.data_x) / len(self.data_x),
+            sum(self.data_y) / len(self.data_y),
+            sum(self.data_z) / len(self.data_z)
+        )
+
+class StationaryDetector:
+    """Detects when the IMU is stationary using ZUPT (Zero Velocity Update)"""
+    
+    def __init__(self, accel_threshold=0.05, gyro_threshold=5.0, window_size=20):
+        """
+        Args:
+            accel_threshold: Acceleration variance threshold in g units
+            gyro_threshold: Gyroscope variance threshold in deg/s
+            window_size: Number of samples to consider for variance calculation
+        """
+        self.accel_threshold = accel_threshold
+        self.gyro_threshold = gyro_threshold
+        self.window_size = window_size
+        
+        self.accel_history = deque(maxlen=window_size)
+        self.gyro_history = deque(maxlen=window_size)
+    
+    def update(self, accel: Vector3D, gyro: Vector3D) -> bool:
+        """
+        Check if IMU is stationary based on acceleration and gyroscope variance
+        Returns True if stationary, False otherwise
+        """
+        self.accel_history.append(accel.magnitude())
+        self.gyro_history.append(gyro.magnitude())
+        
+        # Need enough samples
+        if len(self.accel_history) < self.window_size:
+            return False
+        
+        # Calculate variance
+        accel_variance = np.var(list(self.accel_history))
+        gyro_variance = np.var(list(self.gyro_history))
+        
+        # Check if both are below threshold
+        is_stationary = (accel_variance < self.accel_threshold and 
+                        gyro_variance < self.gyro_threshold)
+        
+        return is_stationary
+
+class PositionTracker:
+    """Integrates acceleration to velocity and position with ZUPT"""
+    
+    def __init__(self, gravity=9.81):
+        self.gravity = gravity
+        self.velocity = Vector3D()
+        self.position = Vector3D()
+        
+        # Kalman filters for each axis
+        self.kalman_x = KalmanFilter(process_variance=1e-4, measurement_variance=0.1)
+        self.kalman_y = KalmanFilter(process_variance=1e-4, measurement_variance=0.1)
+        self.kalman_z = KalmanFilter(process_variance=1e-4, measurement_variance=0.1)
+        
+        # Moving average for smoothing
+        self.ma_filter = MovingAverageFilter(window_size=5)
+        
+        # Stationary detector for ZUPT
+        self.stationary_detector = StationaryDetector(
+            accel_threshold=0.01,  # Lower = more sensitive to movement
+            gyro_threshold=2.0,
+            window_size=20
+        )
+        
+        # Bias calibration
+        self.accel_bias = Vector3D()
+        self.is_calibrated = False
+        
+        # ZUPT statistics
+        self.zupt_count = 0
+        self.is_stationary = False
+        
+        # High-pass filter coefficients for drift removal
+        self.alpha_hp = 0.95  # High-pass filter coefficient
+        self.vel_hp_x = 0.0
+        self.vel_hp_y = 0.0
+        self.vel_hp_z = 0.0
+    
+    def calibrate(self, mpu: MPU6050, samples=100):
+        """Calibrate by measuring bias while stationary"""
+        print("Calibrating... Keep sensor stationary!")
+        bias_sum = Vector3D()
+        
+        for i in range(samples):
+            accel = mpu.read_accel()
+            bias_sum = bias_sum + accel
+            time.sleep(0.01)
+        
+        self.accel_bias = Vector3D(
+            bias_sum.x / samples,
+            bias_sum.y / samples,
+            (bias_sum.z / samples) - 1.0  # Remove gravity from z-axis
+        )
+        self.is_calibrated = True
+        print(f"Calibration complete! Bias: X={self.accel_bias.x:.4f}, "
+              f"Y={self.accel_bias.y:.4f}, Z={self.accel_bias.z:.4f}")
+    
+    def apply_deadzone(self, value: float, threshold=0.05) -> float:
+        """Apply deadzone to reduce drift from small values"""
+        return value if abs(value) > threshold else 0.0
+    
+    def apply_high_pass_filter(self, velocity: Vector3D) -> Vector3D:
+        """Apply high-pass filter to velocity to remove DC drift"""
+        # High-pass filter: y[n] = alpha * (y[n-1] + x[n] - x[n-1])
+        new_vel_x = self.alpha_hp * (self.vel_hp_x + velocity.x - self.vel_hp_x)
+        new_vel_y = self.alpha_hp * (self.vel_hp_y + velocity.y - self.vel_hp_y)
+        new_vel_z = self.alpha_hp * (self.vel_hp_z + velocity.z - self.vel_hp_z)
+        
+        # Store current velocity for next iteration
+        self.vel_hp_x = velocity.x
+        self.vel_hp_y = velocity.y
+        self.vel_hp_z = velocity.z
+        
+        return Vector3D(new_vel_x, new_vel_y, new_vel_z)
+    
+    def update(self, accel: Vector3D, gyro: Vector3D, dt: float) -> Tuple[Vector3D, Vector3D]:
+        """Update position using double integration with ZUPT"""
+        if not self.is_calibrated:
+            raise ValueError("Sensor not calibrated! Call calibrate() first.")
+        
+        # Check if stationary (ZUPT)
+        self.is_stationary = self.stationary_detector.update(accel, gyro)
+        
+        if self.is_stationary:
+            # Zero Velocity Update - reset velocity to prevent drift
+            self.velocity = Vector3D(0, 0, 0)
+            self.zupt_count += 1
+            return self.velocity, self.position
+        
+        # Remove bias
+        accel_corrected = Vector3D(
+            accel.x - self.accel_bias.x,
+            accel.y - self.accel_bias.y,
+            accel.z - self.accel_bias.z
+        )
+        
+        # Apply Kalman filtering
+        accel_filtered = Vector3D(
+            self.kalman_x.update(accel_corrected.x),
+            self.kalman_y.update(accel_corrected.y),
+            self.kalman_z.update(accel_corrected.z)
+        )
+        
+        # Apply moving average
+        accel_smooth = self.ma_filter.update(accel_filtered)
+        
+        # Apply deadzone to reduce drift
+        accel_clean = Vector3D(
+            self.apply_deadzone(accel_smooth.x, threshold=0.02),
+            self.apply_deadzone(accel_smooth.y, threshold=0.02),
+            self.apply_deadzone(accel_smooth.z, threshold=0.02)
+        )
+        
+        # Convert to m/s²
+        accel_ms2 = accel_clean * self.gravity
+        
+        # Kinematics: v = v0 + a*dt
+        self.velocity = self.velocity + accel_ms2 * dt
+        
+        # Apply high-pass filter to velocity to remove drift
+        self.velocity = self.apply_high_pass_filter(self.velocity)
+        
+        # Apply velocity deadzone
+        self.velocity = Vector3D(
+            self.apply_deadzone(self.velocity.x, threshold=0.01),
+            self.apply_deadzone(self.velocity.y, threshold=0.01),
+            self.apply_deadzone(self.velocity.z, threshold=0.01)
+        )
+        
+        # Kinematics: s = s0 + v*dt
+        self.position = self.position + self.velocity * dt
+        
+        return self.velocity, self.position
+    
+    def reset(self):
+        """Reset velocity and position to zero"""
+        self.velocity = Vector3D()
+        self.position = Vector3D()
+        self.zupt_count = 0
+        print("Position and velocity reset to zero")
+
+def main():
+    """Main tracking loop"""
+    print("MPU6050 Position Tracking System with ZUPT")
+    print("=" * 50)
+    
+    # Initialize MPU6050
+    try:
+        mpu = MPU6050(bus_num=1, address=0x68)
+        print("✓ MPU6050 initialized")
+    except Exception as e:
+        print(f"✗ Failed to initialize MPU6050: {e}")
+        print("Make sure I2C is enabled: sudo raspi-config -> Interface Options -> I2C")
+        return
+    
+    # Initialize position tracker
+    tracker = PositionTracker()
+    
+    # Calibrate sensor
+    tracker.calibrate(mpu, samples=100)
+    
+    # Initialize complementary filter for orientation
+    comp_filter = ComplementaryFilter(alpha=0.98)
+    
+    print("\nStarting position tracking with ZUPT...")
+    print("ZUPT will reset velocity when stationary to prevent drift")
+    print("Press Ctrl+C to stop\n")
+    
+    last_time = time.time()
+    update_counter = 0
+    
+    try:
+        while True:
+            # Calculate dt
+            current_time = time.time()
+            dt = current_time - last_time
+            last_time = current_time
+            
+            # Read sensor data
+            accel = mpu.read_accel()
+            gyro = mpu.read_gyro()
+            
+            # Update orientation (for reference)
+            angle = comp_filter.update(accel, gyro, dt)
+            
+            # Update position with ZUPT
+            velocity, position = tracker.update(accel, gyro, dt)
+            
+            # Print status every 10 iterations
+            update_counter += 1
+            if update_counter >= 10:
+                status = "[STATIONARY]" if tracker.is_stationary else "[MOVING]    "
+                print(f"{status} Pos: X={position.x:7.3f}m Y={position.y:7.3f}m Z={position.z:7.3f}m | "
+                      f"Vel: X={velocity.x:6.3f}m/s Y={velocity.y:6.3f}m/s Z={velocity.z:6.3f}m/s | "
+                      f"ZUPT: {tracker.zupt_count}", 
+                      end='\r')
+                update_counter = 0
+            
+            # Small delay for consistent sampling
+            time.sleep(0.01)  # 100 Hz
+            
+    except KeyboardInterrupt:
+        print("\n\nStopping...")
+        print(f"\nFinal Position:")
+        print(f"  X: {position.x:.3f} m")
+        print(f"  Y: {position.y:.3f} m")
+        print(f"  Z: {position.z:.3f} m")
+        print(f"\nZUPT activations: {tracker.zupt_count}")
+
+if __name__ == "__main__":
+    main()
