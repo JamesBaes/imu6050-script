@@ -1,0 +1,438 @@
+import smbus2
+import time
+import numpy as np
+from dataclasses import dataclass
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Control sensitivity (adjust these to tune response)
+TILT_DEADZONE = 5.0           # Degrees - no movement if tilt < this
+MAX_TILT_ANGLE = 45.0         # Degrees - maximum tilt for full speed
+MAX_VELOCITY = 0.2            # m/s - maximum velocity at full tilt
+
+# Control mode
+EXPONENTIAL_RESPONSE = True   # True = gentle at small tilts, aggressive at large tilts
+                              # False = linear response
+
+# Update rate
+UPDATE_RATE_HZ = 50          # How often to update (Hz)
+
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+@dataclass
+class Vector3D:
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+    
+    def magnitude(self):
+        return np.sqrt(self.x**2 + self.y**2 + self.z**2)
+
+@dataclass
+class VelocityCommand:
+    """Velocity command for robot arm"""
+    vx: float = 0.0  # Forward/back velocity
+    vy: float = 0.0  # Left/right velocity
+    vz: float = 0.0  # Up/down velocity
+    
+    def magnitude(self):
+        return np.sqrt(self.vx**2 + self.vy**2 + self.vz**2)
+    
+    def __str__(self):
+        return f"Velocity(X={self.vx:+.3f}, Y={self.vy:+.3f}, Z={self.vz:+.3f} m/s)"
+
+# ============================================================================
+# MPU6050 INTERFACE
+# ============================================================================
+
+class MPU6050:
+    """MPU6050 IMU interface"""
+    
+    PWR_MGMT_1 = 0x6B
+    ACCEL_XOUT_H = 0x3B
+    GYRO_XOUT_H = 0x43
+    ACCEL_SCALE = 16384.0
+    GYRO_SCALE = 131.0
+    
+    def __init__(self, bus_num=1, address=0x68):
+        self.bus = smbus2.SMBus(bus_num)
+        self.address = address
+        self._initialize()
+    
+    def _initialize(self):
+        self.bus.write_byte_data(self.address, self.PWR_MGMT_1, 0)
+        time.sleep(0.1)
+    
+    def read_raw_data(self, reg):
+        high = self.bus.read_byte_data(self.address, reg)
+        low = self.bus.read_byte_data(self.address, reg + 1)
+        value = (high << 8) | low
+        if value > 32768:
+            value -= 65536
+        return value
+    
+    def read_accel(self) -> Vector3D:
+        ax = self.read_raw_data(self.ACCEL_XOUT_H) / self.ACCEL_SCALE
+        ay = self.read_raw_data(self.ACCEL_XOUT_H + 2) / self.ACCEL_SCALE
+        az = self.read_raw_data(self.ACCEL_XOUT_H + 4) / self.ACCEL_SCALE
+        return Vector3D(ax, ay, az)
+    
+    def read_gyro(self) -> Vector3D:
+        gx = self.read_raw_data(self.GYRO_XOUT_H) / self.GYRO_SCALE
+        gy = self.read_raw_data(self.GYRO_XOUT_H + 2) / self.GYRO_SCALE
+        gz = self.read_raw_data(self.GYRO_XOUT_H + 4) / self.GYRO_SCALE
+        return Vector3D(gx, gy, gz)
+
+# ============================================================================
+# COMPLEMENTARY FILTER (For stable tilt angles)
+# ============================================================================
+
+class ComplementaryFilter:
+    """Fuses accelerometer and gyroscope for stable tilt angles"""
+    
+    def __init__(self, alpha=0.96):
+        self.alpha = alpha  # Gyro trust (0.96 = 96% gyro, 4% accel)
+        self.roll = 0.0     # Tilt left/right
+        self.pitch = 0.0    # Tilt forward/back
+    
+    def update(self, accel: Vector3D, gyro: Vector3D, dt: float):
+        """Update filter and return current tilt angles"""
+        
+        # Integrate gyroscope (measures rotation rate)
+        self.roll += gyro.x * dt
+        self.pitch += gyro.y * dt
+        
+        # Calculate tilt from accelerometer (measures gravity direction)
+        accel_roll = np.arctan2(accel.y, np.sqrt(accel.x**2 + accel.z**2)) * 180 / np.pi
+        accel_pitch = np.arctan2(-accel.x, np.sqrt(accel.y**2 + accel.z**2)) * 180 / np.pi
+        
+        # Complementary filter: trust gyro short-term, accel long-term
+        self.roll = self.alpha * self.roll + (1 - self.alpha) * accel_roll
+        self.pitch = self.alpha * self.pitch + (1 - self.alpha) * accel_pitch
+        
+        return self.roll, self.pitch
+
+# ============================================================================
+# TILT CONTROLLER
+# ============================================================================
+
+class TiltVelocityController:
+    """Maps IMU tilt angles to velocity commands"""
+    
+    def __init__(self, 
+                 max_tilt=MAX_TILT_ANGLE,
+                 max_velocity=MAX_VELOCITY,
+                 deadzone=TILT_DEADZONE,
+                 exponential=EXPONENTIAL_RESPONSE):
+        
+        self.max_tilt = max_tilt
+        self.max_velocity = max_velocity
+        self.deadzone = deadzone
+        self.exponential = exponential
+        
+        # Calibration offset (neutral position)
+        self.roll_offset = 0.0
+        self.pitch_offset = 0.0
+        self.is_calibrated = False
+    
+    def calibrate(self, roll: float, pitch: float):
+        """Set current orientation as neutral (zero velocity) position"""
+        self.roll_offset = roll
+        self.pitch_offset = pitch
+        self.is_calibrated = True
+        print(f"✓ Calibrated! Neutral position: Roll={roll:.1f}°, Pitch={pitch:.1f}°")
+    
+    def apply_deadzone(self, value: float) -> float:
+        """Apply deadzone to ignore small tilts"""
+        if abs(value) < self.deadzone:
+            return 0.0
+        # Remove deadzone offset so response starts smoothly
+        sign = 1 if value > 0 else -1
+        return sign * (abs(value) - self.deadzone)
+    
+    def tilt_to_velocity(self, tilt: float) -> float:
+        """Convert tilt angle to velocity (0 to max_velocity)"""
+        
+        # Apply deadzone
+        tilt = self.apply_deadzone(tilt)
+        
+        if tilt == 0:
+            return 0.0
+        
+        # Normalize to 0-1 range
+        normalized = abs(tilt) / (self.max_tilt - self.deadzone)
+        normalized = min(1.0, normalized)  # Clamp to max
+        
+        # Apply response curve
+        if self.exponential:
+            # Exponential: gentle at small tilts, aggressive at large tilts
+            # Using x^2 curve
+            response = normalized ** 2
+        else:
+            # Linear response
+            response = normalized
+        
+        # Scale to velocity and restore sign
+        sign = 1 if tilt > 0 else -1
+        velocity = sign * response * self.max_velocity
+        
+        return velocity
+    
+    def update(self, roll: float, pitch: float) -> VelocityCommand:
+        """Convert current tilt to velocity command"""
+        
+        if not self.is_calibrated:
+            return VelocityCommand(0, 0, 0)
+        
+        # Remove calibration offset
+        roll_relative = roll - self.roll_offset
+        pitch_relative = pitch - self.pitch_offset
+        
+        # Map to velocities
+        # Roll (left/right tilt) → Y velocity (side-to-side)
+        # Pitch (forward/back tilt) → X velocity (forward/back)
+        
+        vx = self.tilt_to_velocity(pitch_relative)   # Forward/back
+        vy = self.tilt_to_velocity(roll_relative)    # Left/right
+        vz = 0.0  # No vertical control for now (can add twist/yaw later)
+        
+        return VelocityCommand(vx, vy, vz)
+
+# ============================================================================
+# MAIN CONTROL LOOP
+# ============================================================================
+
+def main():
+    print("=" * 70)
+    print("IMU Tilt-Based Velocity Controller")
+    print("=" * 70)
+    print()
+    print("Control Mode: Tilt IMU to control velocity")
+    print("  - Tilt forward/back → Move X axis")
+    print("  - Tilt left/right → Move Y axis")
+    print("  - Steeper angle = faster movement")
+    print()
+    
+    # Initialize MPU6050
+    try:
+        mpu = MPU6050()
+        print("✓ MPU6050 initialized")
+    except Exception as e:
+        print(f"✗ Failed to initialize MPU6050: {e}")
+        print("Make sure I2C is enabled: sudo raspi-config -> Interface Options -> I2C")
+        return
+    
+    # Initialize complementary filter
+    comp_filter = ComplementaryFilter(alpha=0.96)
+    
+    # Initialize tilt controller
+    controller = TiltVelocityController(
+        max_tilt=MAX_TILT_ANGLE,
+        max_velocity=MAX_VELOCITY,
+        deadzone=TILT_DEADZONE,
+        exponential=EXPONENTIAL_RESPONSE
+    )
+    
+    # Calibration
+    print()
+    print("Calibration:")
+    print("  Hold IMU in neutral position (position for zero velocity)")
+    input("  Press ENTER when ready...")
+    
+    # Take average of several samples for stable calibration
+    print("  Calibrating... (hold still)")
+    roll_sum = 0.0
+    pitch_sum = 0.0
+    samples = 50
+    
+    for i in range(samples):
+        accel = mpu.read_accel()
+        gyro = mpu.read_gyro()
+        roll, pitch = comp_filter.update(accel, gyro, 0.01)
+        roll_sum += roll
+        pitch_sum += pitch
+        time.sleep(0.01)
+    
+    controller.calibrate(roll_sum / samples, pitch_sum / samples)
+    
+    # Display configuration
+    print()
+    print("Configuration:")
+    print(f"  Max tilt angle: {MAX_TILT_ANGLE}°")
+    print(f"  Max velocity: {MAX_VELOCITY} m/s")
+    print(f"  Deadzone: {TILT_DEADZONE}°")
+    print(f"  Response curve: {'Exponential (x²)' if EXPONENTIAL_RESPONSE else 'Linear'}")
+    print()
+    print("Starting controller...")
+    print("Press Ctrl+C to stop")
+    print()
+    
+    # Main control loop
+    last_time = time.time()
+    dt = 1.0 / UPDATE_RATE_HZ
+    
+    try:
+        while True:
+            current_time = time.time()
+            actual_dt = current_time - last_time
+            last_time = current_time
+            
+            # Read sensors
+            accel = mpu.read_accel()
+            gyro = mpu.read_gyro()
+            
+            # Update tilt estimate
+            roll, pitch = comp_filter.update(accel, gyro, actual_dt)
+            
+            # Convert tilt to velocity command
+            velocity_cmd = controller.update(roll, pitch)
+            
+            # Display current state
+            print(f"Tilt: Roll={roll:+6.1f}° Pitch={pitch:+6.1f}° | "
+                  f"Velocity: X={velocity_cmd.vx:+6.3f} Y={velocity_cmd.vy:+6.3f} m/s | "
+                  f"Speed: {velocity_cmd.magnitude():.3f} m/s", 
+                  end='\r')
+            
+            # ============================================================
+            # ROBOT ARM INTEGRATION POINT
+            # ============================================================
+            # Send velocity_cmd to your robot arm here:
+            # robot.move_velocity(velocity_cmd.vx, velocity_cmd.vy, velocity_cmd.vz)
+            # ============================================================
+            
+            # Sleep to maintain update rate
+            time.sleep(dt)
+            
+    except KeyboardInterrupt:
+        print("\n\nStopping...")
+        print("Final state:")
+        print(f"  Roll: {roll:.1f}°")
+        print(f"  Pitch: {pitch:.1f}°")
+        print(f"  Velocity command: {velocity_cmd}")
+
+# ============================================================================
+# ALTERNATIVE: POSITION CONTROL MODE
+# ============================================================================
+
+def position_control_mode():
+    """Alternative: Integrate velocity to get relative position"""
+    
+    print("Position Control Mode (with velocity integration)")
+    
+    mpu = MPU6050()
+    comp_filter = ComplementaryFilter(alpha=0.96)
+    controller = TiltVelocityController()
+    
+    # Calibrate
+    print("Hold IMU neutral...")
+    time.sleep(1)
+    
+    samples = 50
+    roll_sum = pitch_sum = 0.0
+    for i in range(samples):
+        accel = mpu.read_accel()
+        gyro = mpu.read_gyro()
+        roll, pitch = comp_filter.update(accel, gyro, 0.01)
+        roll_sum += roll
+        pitch_sum += pitch
+        time.sleep(0.01)
+    
+    controller.calibrate(roll_sum / samples, pitch_sum / samples)
+    
+    # Position tracking
+    position_x = 0.0
+    position_y = 0.0
+    position_z = 0.0
+    
+    last_time = time.time()
+    
+    print("\nTilt to move, level to stop")
+    print("Position integrates velocity (hold tilt = continuous movement)")
+    print()
+    
+    try:
+        while True:
+            current_time = time.time()
+            dt = current_time - last_time
+            last_time = current_time
+            
+            accel = mpu.read_accel()
+            gyro = mpu.read_gyro()
+            roll, pitch = comp_filter.update(accel, gyro, dt)
+            
+            # Get velocity from tilt
+            velocity_cmd = controller.update(roll, pitch)
+            
+            # Integrate to position
+            position_x += velocity_cmd.vx * dt
+            position_y += velocity_cmd.vy * dt
+            position_z += velocity_cmd.vz * dt
+            
+            print(f"Tilt: R={roll:+5.1f}° P={pitch:+5.1f}° | "
+                  f"Vel: X={velocity_cmd.vx:+.2f} Y={velocity_cmd.vy:+.2f} | "
+                  f"Pos: X={position_x:+6.2f} Y={position_y:+6.2f} Z={position_z:+6.2f} m",
+                  end='\r')
+            
+            # Send to robot
+            # robot.move_to(position_x, position_y, position_z)
+            
+            time.sleep(0.02)
+            
+    except KeyboardInterrupt:
+        print("\n\nStopped")
+        print(f"Final position: X={position_x:.3f}, Y={position_y:.3f}, Z={position_z:.3f} m")
+
+# ============================================================================
+# VISUAL DEMO MODE
+# ============================================================================
+
+def demo_response_curve():
+    """Show how tilt maps to velocity"""
+    
+    print("\n" + "=" * 50)
+    print("Response Curve Demo")
+    print("=" * 50)
+    
+    controller = TiltVelocityController()
+    controller.calibrate(0, 0)  # Assume neutral is flat
+    
+    print("\nLinear Response:")
+    print("Tilt (°) | Velocity (m/s) | %Max")
+    print("-" * 40)
+    
+    controller.exponential = False
+    for angle in [0, 5, 10, 15, 20, 30, 45, 60]:
+        vel = controller.tilt_to_velocity(angle)
+        pct = (abs(vel) / MAX_VELOCITY) * 100
+        bar = "█" * int(pct / 2)
+        print(f"{angle:6.0f}   | {vel:14.3f} | {pct:3.0f}% {bar}")
+    
+    print("\nExponential Response (x²):")
+    print("Tilt (°) | Velocity (m/s) | %Max")
+    print("-" * 40)
+    
+    controller.exponential = True
+    for angle in [0, 5, 10, 15, 20, 30, 45, 60]:
+        vel = controller.tilt_to_velocity(angle)
+        pct = (abs(vel) / MAX_VELOCITY) * 100
+        bar = "█" * int(pct / 2)
+        print(f"{angle:6.0f}   | {vel:14.3f} | {pct:3.0f}% {bar}")
+    
+    print()
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+if __name__ == "__main__":
+    # Uncomment the mode you want:
+    
+    main()  # Velocity control (recommended)
+    
+    # position_control_mode()  # Position control (integrates velocity)
+    
+    # demo_response_curve()  # Show response curves
