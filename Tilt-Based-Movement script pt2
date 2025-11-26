@@ -1,0 +1,444 @@
+import smbus2
+import time
+import numpy as np
+from dataclasses import dataclass
+from enum import Enum
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Tilt thresholds for triggering movement
+TILT_THRESHOLD = 15.0          # Degrees - minimum tilt to trigger movement
+TILT_NEUTRAL_ZONE = 5.0        # Degrees - deadzone around neutral
+
+# Servo configuration
+SERVO_STEP_SIZE = 5            # Degrees to move servo per trigger
+SERVO_MOVE_DELAY = 0.2         # Seconds between moves (prevents rapid fire)
+
+# Servo limits (adjust for your servos)
+SERVO_LIMITS = {
+    'base': (0, 180),          # Base rotation (left/right)
+    'shoulder': (0, 180),      # Shoulder (forward/back)
+    'elbow': (0, 180)          # Elbow (up/down)
+}
+
+# Update rate
+UPDATE_RATE_HZ = 20
+
+# ============================================================================
+# DIRECTION ENUM
+# ============================================================================
+
+class TiltDirection(Enum):
+    NEUTRAL = 0
+    LEFT = 1
+    RIGHT = 2
+    FORWARD = 3
+    BACK = 4
+    UP = 5
+    DOWN = 6
+
+# ============================================================================
+# SERVO POSITIONS
+# ============================================================================
+
+@dataclass
+class ServoPositions:
+    """Current servo angles"""
+    base: float = 90.0       # Left/right rotation
+    shoulder: float = 90.0   # Forward/back
+    elbow: float = 90.0      # Up/down
+    
+    def __str__(self):
+        return f"Servos(Base={self.base:.0f}°, Shoulder={self.shoulder:.0f}°, Elbow={self.elbow:.0f}°)"
+
+# ============================================================================
+# MPU6050 INTERFACE (simplified from your code)
+# ============================================================================
+
+class MPU6050:
+    """MPU6050 IMU interface"""
+    
+    PWR_MGMT_1 = 0x6B
+    ACCEL_XOUT_H = 0x3B
+    GYRO_XOUT_H = 0x43
+    ACCEL_SCALE = 16384.0
+    GYRO_SCALE = 131.0
+    
+    def __init__(self, bus_num=1, address=0x68):
+        self.bus = smbus2.SMBus(bus_num)
+        self.address = address
+        self._initialize()
+    
+    def _initialize(self):
+        self.bus.write_byte_data(self.address, self.PWR_MGMT_1, 0)
+        time.sleep(0.1)
+    
+    def read_raw_data(self, reg):
+        high = self.bus.read_byte_data(self.address, reg)
+        low = self.bus.read_byte_data(self.address, reg + 1)
+        value = (high << 8) | low
+        if value > 32768:
+            value -= 65536
+        return value
+    
+    def read_accel(self):
+        ax = self.read_raw_data(self.ACCEL_XOUT_H) / self.ACCEL_SCALE
+        ay = self.read_raw_data(self.ACCEL_XOUT_H + 2) / self.ACCEL_SCALE
+        az = self.read_raw_data(self.ACCEL_XOUT_H + 4) / self.ACCEL_SCALE
+        return ax, ay, az
+    
+    def read_gyro(self):
+        gx = self.read_raw_data(self.GYRO_XOUT_H) / self.GYRO_SCALE
+        gy = self.read_raw_data(self.GYRO_XOUT_H + 2) / self.GYRO_SCALE
+        gz = self.read_raw_data(self.GYRO_XOUT_H + 4) / self.GYRO_SCALE
+        return gx, gy, gz
+
+# ============================================================================
+# COMPLEMENTARY FILTER
+# ============================================================================
+
+class ComplementaryFilter:
+    """Fuses accelerometer and gyroscope for stable tilt angles"""
+    
+    def __init__(self, alpha=0.96):
+        self.alpha = alpha
+        self.roll = 0.0
+        self.pitch = 0.0
+    
+    def update(self, accel, gyro, dt):
+        ax, ay, az = accel
+        gx, gy, gz = gyro
+        
+        # Integrate gyroscope
+        self.roll += gx * dt
+        self.pitch += gy * dt
+        
+        # Calculate from accelerometer
+        accel_roll = np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi
+        accel_pitch = np.arctan2(-ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi
+        
+        # Complementary filter
+        self.roll = self.alpha * self.roll + (1 - self.alpha) * accel_roll
+        self.pitch = self.alpha * self.pitch + (1 - self.alpha) * accel_pitch
+        
+        return self.roll, self.pitch
+
+# ============================================================================
+# TILT-TO-SERVO CONTROLLER
+# ============================================================================
+
+class TiltServoController:
+    """Maps IMU tilt to discrete servo movements"""
+    
+    def __init__(self,
+                 tilt_threshold=TILT_THRESHOLD,
+                 neutral_zone=TILT_NEUTRAL_ZONE,
+                 servo_step=SERVO_STEP_SIZE,
+                 move_delay=SERVO_MOVE_DELAY):
+        
+        self.tilt_threshold = tilt_threshold
+        self.neutral_zone = neutral_zone
+        self.servo_step = servo_step
+        self.move_delay = move_delay
+        
+        # Current servo positions
+        self.servos = ServoPositions()
+        
+        # Calibration offsets
+        self.roll_offset = 0.0
+        self.pitch_offset = 0.0
+        self.is_calibrated = False
+        
+        # Movement timing (prevent rapid fire)
+        self.last_move_time = 0.0
+        self.last_direction = TiltDirection.NEUTRAL
+    
+    def calibrate(self, roll: float, pitch: float):
+        """Set current tilt as neutral position"""
+        self.roll_offset = roll
+        self.pitch_offset = pitch
+        self.is_calibrated = True
+        print(f"✓ Calibrated! Neutral: Roll={roll:.1f}°, Pitch={pitch:.1f}°")
+    
+    def detect_direction(self, roll: float, pitch: float) -> TiltDirection:
+        """Detect which direction is tilted based on thresholds"""
+        
+        if not self.is_calibrated:
+            return TiltDirection.NEUTRAL
+        
+        # Remove calibration offset
+        roll_rel = roll - self.roll_offset
+        pitch_rel = pitch - self.pitch_offset
+        
+        # Check if within neutral zone
+        if abs(roll_rel) < self.neutral_zone and abs(pitch_rel) < self.neutral_zone:
+            return TiltDirection.NEUTRAL
+        
+        # Determine primary direction (largest tilt magnitude)
+        # This prevents diagonal confusion
+        
+        if abs(roll_rel) > abs(pitch_rel):
+            # Roll is dominant (left/right)
+            if roll_rel > self.tilt_threshold:
+                return TiltDirection.RIGHT
+            elif roll_rel < -self.tilt_threshold:
+                return TiltDirection.LEFT
+        else:
+            # Pitch is dominant (forward/back)
+            if pitch_rel > self.tilt_threshold:
+                return TiltDirection.BACK
+            elif pitch_rel < -self.tilt_threshold:
+                return TiltDirection.FORWARD
+        
+        return TiltDirection.NEUTRAL
+    
+    def clamp_servo(self, angle: float, servo_name: str) -> float:
+        """Clamp servo angle to limits"""
+        min_angle, max_angle = SERVO_LIMITS[servo_name]
+        return np.clip(angle, min_angle, max_angle)
+    
+    def move_servo(self, direction: TiltDirection) -> bool:
+        """Move servos based on detected direction"""
+        
+        # Check if enough time has passed since last move
+        current_time = time.time()
+        if current_time - self.last_move_time < self.move_delay:
+            return False
+        
+        # Don't move if neutral or same direction held
+        if direction == TiltDirection.NEUTRAL:
+            self.last_direction = TiltDirection.NEUTRAL
+            return False
+        
+        # Track movement
+        moved = False
+        
+        # Map directions to servo movements
+        if direction == TiltDirection.LEFT:
+            self.servos.base -= self.servo_step
+            self.servos.base = self.clamp_servo(self.servos.base, 'base')
+            moved = True
+            print(f"  ← LEFT - Base: {self.servos.base:.0f}°")
+        
+        elif direction == TiltDirection.RIGHT:
+            self.servos.base += self.servo_step
+            self.servos.base = self.clamp_servo(self.servos.base, 'base')
+            moved = True
+            print(f"  → RIGHT - Base: {self.servos.base:.0f}°")
+        
+        elif direction == TiltDirection.FORWARD:
+            self.servos.shoulder += self.servo_step
+            self.servos.shoulder = self.clamp_servo(self.servos.shoulder, 'shoulder')
+            moved = True
+            print(f"  ↑ FORWARD - Shoulder: {self.servos.shoulder:.0f}°")
+        
+        elif direction == TiltDirection.BACK:
+            self.servos.shoulder -= self.servo_step
+            self.servos.shoulder = self.clamp_servo(self.servos.shoulder, 'shoulder')
+            moved = True
+            print(f"  ↓ BACK - Shoulder: {self.servos.shoulder:.0f}°")
+        
+        # Update timing
+        if moved:
+            self.last_move_time = current_time
+            self.last_direction = direction
+        
+        return moved
+    
+    def update(self, roll: float, pitch: float) -> tuple:
+        """Main update: detect tilt and move servos"""
+        
+        # Detect direction
+        direction = self.detect_direction(roll, pitch)
+        
+        # Move servo if triggered
+        self.move_servo(direction)
+        
+        return direction, self.servos
+
+# ============================================================================
+# SERVO INTERFACE (You'll need to implement this for your hardware)
+# ============================================================================
+
+class ServoDriver:
+    """Interface to control actual servos - IMPLEMENT FOR YOUR HARDWARE"""
+    
+    def __init__(self):
+        # Initialize your servo driver here
+        # Examples:
+        # - pigpio for GPIO PWM
+        # - PCA9685 I2C servo driver
+        # - Adafruit ServoKit
+        pass
+    
+    def set_servo_angle(self, servo_name: str, angle: float):
+        """Set servo to specific angle"""
+        print(f"  [SERVO] {servo_name}: {angle:.0f}°")
+        
+        # ============================================================
+        # IMPLEMENT YOUR SERVO CONTROL HERE
+        # ============================================================
+        # Examples:
+        #
+        # Using pigpio:
+        # pulse_width = 500 + (angle / 180) * 2000
+        # pi.set_servo_pulsewidth(pin, pulse_width)
+        #
+        # Using PCA9685:
+        # pulse = int((angle / 180) * (servo_max - servo_min) + servo_min)
+        # pca.set_pwm(channel, 0, pulse)
+        #
+        # Using Adafruit ServoKit:
+        # kit.servo[channel].angle = angle
+        # ============================================================
+        
+        pass
+
+# ============================================================================
+# MAIN CONTROL LOOP
+# ============================================================================
+
+def main():
+    print("=" * 70)
+    print("IMU Tilt-Based Servo Controller")
+    print("=" * 70)
+    print()
+    print("Control Mode: Tilt IMU to move servos")
+    print("  - Tilt LEFT → Base servo rotates left")
+    print("  - Tilt RIGHT → Base servo rotates right")
+    print("  - Tilt FORWARD → Shoulder servo moves forward")
+    print("  - Tilt BACK → Shoulder servo moves back")
+    print()
+    print(f"Tilt threshold: {TILT_THRESHOLD}°")
+    print(f"Servo step size: {SERVO_STEP_SIZE}°")
+    print(f"Move delay: {SERVO_MOVE_DELAY}s")
+    print()
+    
+    # Initialize hardware
+    try:
+        mpu = MPU6050()
+        print("✓ MPU6050 initialized")
+    except Exception as e:
+        print(f"✗ Failed to initialize MPU6050: {e}")
+        return
+    
+    # Initialize servo driver
+    servo_driver = ServoDriver()
+    print("✓ Servo driver initialized")
+    
+    # Initialize filters and controller
+    comp_filter = ComplementaryFilter(alpha=0.96)
+    controller = TiltServoController(
+        tilt_threshold=TILT_THRESHOLD,
+        neutral_zone=TILT_NEUTRAL_ZONE,
+        servo_step=SERVO_STEP_SIZE,
+        move_delay=SERVO_MOVE_DELAY
+    )
+    
+    # Calibration
+    print()
+    print("Calibration:")
+    print("  Hold IMU in neutral position (flat/level)")
+    input("  Press ENTER when ready...")
+    
+    print("  Calibrating... (hold still)")
+    roll_sum = pitch_sum = 0.0
+    samples = 50
+    
+    for i in range(samples):
+        accel = mpu.read_accel()
+        gyro = mpu.read_gyro()
+        roll, pitch = comp_filter.update(accel, gyro, 0.01)
+        roll_sum += roll
+        pitch_sum += pitch
+        time.sleep(0.01)
+    
+    controller.calibrate(roll_sum / samples, pitch_sum / samples)
+    
+    # Set servos to initial position
+    servo_driver.set_servo_angle('base', controller.servos.base)
+    servo_driver.set_servo_angle('shoulder', controller.servos.shoulder)
+    servo_driver.set_servo_angle('elbow', controller.servos.elbow)
+    
+    print()
+    print("Starting controller...")
+    print("Tilt IMU to move servos. Press Ctrl+C to stop")
+    print()
+    
+    # Main control loop
+    last_time = time.time()
+    dt = 1.0 / UPDATE_RATE_HZ
+    
+    try:
+        while True:
+            current_time = time.time()
+            actual_dt = current_time - last_time
+            last_time = current_time
+            
+            # Read sensors
+            accel = mpu.read_accel()
+            gyro = mpu.read_gyro()
+            
+            # Update tilt estimate
+            roll, pitch = comp_filter.update(accel, gyro, actual_dt)
+            
+            # Update controller (detects direction and moves servos)
+            direction, servos = controller.update(roll, pitch)
+            
+            # Send to actual servos if movement occurred
+            if direction != TiltDirection.NEUTRAL:
+                servo_driver.set_servo_angle('base', servos.base)
+                servo_driver.set_servo_angle('shoulder', servos.shoulder)
+                servo_driver.set_servo_angle('elbow', servos.elbow)
+            
+            # Display current state
+            direction_arrow = {
+                TiltDirection.NEUTRAL: "  ●  ",
+                TiltDirection.LEFT: "  ←  ",
+                TiltDirection.RIGHT: "  →  ",
+                TiltDirection.FORWARD: "  ↑  ",
+                TiltDirection.BACK: "  ↓  "
+            }.get(direction, "  ?  ")
+            
+            print(f"Tilt: Roll={roll:+6.1f}° Pitch={pitch:+6.1f}° | "
+                  f"Dir: {direction_arrow} | "
+                  f"{servos}",
+                  end='\r')
+            
+            # Sleep to maintain update rate
+            time.sleep(dt)
+            
+    except KeyboardInterrupt:
+        print("\n\nStopping...")
+        print(f"Final servo positions: {controller.servos}")
+
+# ============================================================================
+# ALTERNATIVE: Add Z-axis control with buttons or extra tilt
+# ============================================================================
+
+def main_with_z_control():
+    """Extended version with elbow (Z-axis) control"""
+    
+    # ... (same initialization as main) ...
+    
+    print("Extended controls:")
+    print("  - Press 'W' for elbow UP")
+    print("  - Press 'S' for elbow DOWN")
+    print("  (You'll need to implement keyboard input or button GPIO)")
+    
+    # In the main loop, add:
+    # if keyboard.is_pressed('w'):
+    #     controller.servos.elbow += SERVO_STEP_SIZE
+    #     controller.servos.elbow = controller.clamp_servo(controller.servos.elbow, 'elbow')
+    # elif keyboard.is_pressed('s'):
+    #     controller.servos.elbow -= SERVO_STEP_SIZE
+    #     controller.servos.elbow = controller.clamp_servo(controller.servos.elbow, 'elbow')
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+if __name__ == "__main__":
+    main()
