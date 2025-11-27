@@ -1,0 +1,418 @@
+
+import socket
+import smbus2
+import time
+import numpy as np
+import threading
+from dataclasses import dataclass
+
+# Socket Configuration
+HOST = '172.20.10.2'  # Local IP (hostname -I)
+PORT = 8080
+
+# IMU Configuration
+TILT_DEADZONE = 5.0           # No movement if the tilt is less than 5.0
+MAX_TILT_ANGLE = 45.0         # Degrees - maximum tilt for full range
+UPDATE_RATE_HZ = 20           # Updates per second
+
+# Workspace configuration (meters)
+WORKSPACE_CENTER = (0.5, 0.0, 0.3)  # Center position (x, y, z)
+WORKSPACE_SIZE = (0.4, 0.4, 0.2)     # Range in each axis (x, y, z)
+
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+@dataclass
+class Position3D:
+    """3D position"""
+    x: float
+    y: float
+    z: float
+
+# ============================================================================
+# MPU6050 INTERFACE
+# ============================================================================
+
+class MPU6050:
+    """MPU6050 IMU interface"""
+    
+    PWR_MGMT_1 = 0x6B
+    ACCEL_XOUT_H = 0x3B
+    GYRO_XOUT_H = 0x43
+    ACCEL_SCALE = 16384.0
+    GYRO_SCALE = 131.0
+    
+    def __init__(self, bus_num=1, address=0x68):
+        self.bus = smbus2.SMBus(bus_num)
+        self.address = address
+        self._initialize()
+    
+    def _initialize(self):
+        self.bus.write_byte_data(self.address, self.PWR_MGMT_1, 0)
+        time.sleep(0.1)
+    
+    def read_raw_data(self, reg):
+        high = self.bus.read_byte_data(self.address, reg)
+        low = self.bus.read_byte_data(self.address, reg + 1)
+        value = (high << 8) | low
+        if value > 32768:
+            value -= 65536
+        return value
+    
+    def read_accel(self):
+        ax = self.read_raw_data(self.ACCEL_XOUT_H) / self.ACCEL_SCALE
+        ay = self.read_raw_data(self.ACCEL_XOUT_H + 2) / self.ACCEL_SCALE
+        az = self.read_raw_data(self.ACCEL_XOUT_H + 4) / self.ACCEL_SCALE
+        return ax, ay, az
+    
+    def read_gyro(self):
+        gx = self.read_raw_data(self.GYRO_XOUT_H) / self.GYRO_SCALE
+        gy = self.read_raw_data(self.GYRO_XOUT_H + 2) / self.GYRO_SCALE
+        gz = self.read_raw_data(self.GYRO_XOUT_H + 4) / self.GYRO_SCALE
+        return gx, gy, gz
+
+# ============================================================================
+# COMPLEMENTARY FILTER
+# ============================================================================
+
+class ComplementaryFilter:
+    """Fuses accelerometer and gyroscope for stable tilt angles"""
+    
+    def __init__(self, alpha=0.96):
+        self.alpha = alpha
+        self.roll = 0.0
+        self.pitch = 0.0
+    
+    def update(self, accel, gyro, dt):
+        ax, ay, az = accel
+        gx, gy, gz = gyro
+        
+        # Integrate gyroscope
+        self.roll += gx * dt
+        self.pitch += gy * dt
+        
+        # Calculate from accelerometer
+        accel_roll = np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi
+        accel_pitch = np.arctan2(-ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi
+        
+        # Complementary filter
+        self.roll = self.alpha * self.roll + (1 - self.alpha) * accel_roll
+        self.pitch = self.alpha * self.pitch + (1 - self.alpha) * accel_pitch
+        
+        return self.roll, self.pitch
+
+# ============================================================================
+# TILT TO POSITION CONTROLLER
+# ============================================================================
+
+class TiltToPositionController:
+    """Converts IMU tilt to 3D position (x, y, z)"""
+    
+    def __init__(self, 
+                 workspace_center=WORKSPACE_CENTER,
+                 workspace_size=WORKSPACE_SIZE,
+                 max_tilt=MAX_TILT_ANGLE,
+                 deadzone=TILT_DEADZONE):
+        
+        self.center = workspace_center
+        self.size = workspace_size
+        self.max_tilt = max_tilt
+        self.deadzone = deadzone
+        
+        # Calibration
+        self.roll_offset = 0.0
+        self.pitch_offset = 0.0
+        self.is_calibrated = False
+    
+    def calibrate(self, roll: float, pitch: float):
+        """Set current tilt as center position"""
+        self.roll_offset = roll
+        self.pitch_offset = pitch
+        self.is_calibrated = True
+        print(f"✓ Calibrated! Neutral: Roll={roll:.1f}°, Pitch={pitch:.1f}°")
+    
+    def apply_deadzone(self, value: float) -> float:
+        """Apply deadzone to ignore small tilts"""
+        if abs(value) < self.deadzone:
+            return 0.0
+        sign = 1 if value > 0 else -1
+        return sign * (abs(value) - self.deadzone)
+    
+    def tilt_to_position(self, roll: float, pitch: float) -> Position3D:
+        """Convert tilt angles to XYZ position"""
+        
+        if not self.is_calibrated:
+            return Position3D(*self.center)
+        
+        # Remove calibration offset
+        roll_rel = roll - self.roll_offset
+        pitch_rel = pitch - self.pitch_offset
+        
+        # Apply deadzone
+        roll_rel = self.apply_deadzone(roll_rel)
+        pitch_rel = self.apply_deadzone(pitch_rel)
+        
+        # Clamp to max tilt
+        roll_rel = np.clip(roll_rel, -self.max_tilt, self.max_tilt)
+        pitch_rel = np.clip(pitch_rel, -self.max_tilt, self.max_tilt)
+        
+        # Normalize to -1 to +1
+        roll_norm = roll_rel / (self.max_tilt - self.deadzone) if self.max_tilt > self.deadzone else 0
+        pitch_norm = pitch_rel / (self.max_tilt - self.deadzone) if self.max_tilt > self.deadzone else 0
+        
+        # Map to workspace
+        # Pitch (forward/back tilt) → X position
+        # Roll (left/right tilt) → Y position
+        # Z stays at center (can add twist control later)
+        
+        x = self.center[0] + (pitch_norm * self.size[0] / 2)
+        y = self.center[1] + (roll_norm * self.size[1] / 2)
+        z = self.center[2]  # Fixed height for now
+        
+        return Position3D(x, y, z)
+
+# ============================================================================
+# IMU READER (Background Thread)
+# ============================================================================
+
+class IMUReader:
+    """Reads IMU in background thread and maintains current position"""
+    
+    def __init__(self):
+        self.mpu = None
+        self.comp_filter = None
+        self.controller = None
+        self.current_position = Position3D(*WORKSPACE_CENTER)
+        self.current_roll = 0.0
+        self.current_pitch = 0.0
+        self.running = False
+        self.thread = None
+    
+    def initialize(self):
+        """Initialize IMU and filters"""
+        try:
+            self.mpu = MPU6050()
+            print("✓ MPU6050 initialized")
+        except Exception as e:
+            print(f"✗ Failed to initialize MPU6050: {e}")
+            print("Make sure I2C is enabled: sudo raspi-config -> Interface Options -> I2C")
+            return False
+        
+        self.comp_filter = ComplementaryFilter(alpha=0.96)
+        self.controller = TiltToPositionController(
+            workspace_center=WORKSPACE_CENTER,
+            workspace_size=WORKSPACE_SIZE,
+            max_tilt=MAX_TILT_ANGLE,
+            deadzone=TILT_DEADZONE
+        )
+        
+        print("Complementary filter initialized")
+        print("Position controller initialized")
+        
+        return True
+    
+    def calibrate(self):
+        """Calibrate IMU neutral position"""
+        print()
+        print("Calibrating IMU...")
+        print("Hold IMU in neutral position (flat/level)...")
+        time.sleep(2)
+        
+        print("Calibrating... (hold still)")
+        roll_sum = pitch_sum = 0.0
+        samples = 50
+        
+        for i in range(samples):
+            accel = self.mpu.read_accel()
+            gyro = self.mpu.read_gyro()
+            roll, pitch = self.comp_filter.update(accel, gyro, 0.01)
+            roll_sum += roll
+            pitch_sum += pitch
+            time.sleep(0.01)
+        
+        self.controller.calibrate(roll_sum / samples, pitch_sum / samples)
+        print()
+    
+    def _read_loop(self):
+        """Background thread that continuously reads IMU"""
+        last_time = time.time()
+        dt = 1.0 / UPDATE_RATE_HZ
+        
+        while self.running:
+            try:
+                current_time = time.time()
+                actual_dt = current_time - last_time
+                last_time = current_time
+                
+                # Read sensors
+                accel = self.mpu.read_accel()
+                gyro = self.mpu.read_gyro()
+                
+                # Update tilt estimate
+                self.current_roll, self.current_pitch = self.comp_filter.update(accel, gyro, actual_dt)
+                
+                # Convert to position
+                self.current_position = self.controller.tilt_to_position(self.current_roll, self.current_pitch)
+                
+                # Sleep to maintain rate
+                time.sleep(dt)
+                
+            except Exception as e:
+                print(f"Error in IMU loop: {e}")
+                time.sleep(0.1)
+    
+    def start(self):
+        """Start background IMU reading thread"""
+        self.running = True
+        self.thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.thread.start()
+        print("IMU reading thread started")
+    
+    def stop(self):
+        """Stop background thread"""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+    
+    def get_position(self):
+        """Get current position from IMU"""
+        return self.current_position
+    
+    def get_angles(self):
+        """Get current roll and pitch"""
+        return self.current_roll, self.current_pitch
+
+def main():
+    print("Tilt-Based Movement Script")
+    print()
+    
+    # Initialize IMU reader
+    imu_reader = IMUReader()
+    
+    if not imu_reader.initialize():
+        print("Failed to initialize IMU. Exiting...")
+        return
+    
+    # Calibrate IMU
+    imu_reader.calibrate()
+    
+    # Start IMU reading in background
+    imu_reader.start()
+    
+    print(f"Configuration:")
+    print(f"  Host: {HOST}")
+    print(f"  Port: {PORT}")
+    print(f"  Workspace center: {WORKSPACE_CENTER}")
+    print(f"  Workspace size: {WORKSPACE_SIZE}")
+    print(f"  Max tilt: {MAX_TILT_ANGLE}°")
+    print(f"  Deadzone: {TILT_DEADZONE}°")
+    print()
+    print(f"Starting socket server on {HOST}:{PORT}")
+    print("Waiting for Pico to connect...")
+    print()
+    
+    # Ashton's socket server script
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((HOST, PORT))
+        s.listen()
+        
+        print("✓ Socket server listening...")
+        print()
+        
+        conn, addr = s.accept()
+        
+        with conn:
+            print(f"Connected from: {addr}")
+            print()
+            print("Sending IMU position data to Pico.")
+            print("Press Ctrl+C to stop")
+            print()
+            
+            try:
+                while True:
+                    # Receive data from client (optional - for acknowledgment)
+                    try:
+                        data = conn.recv(1024)
+                        if not data:
+                            print("Client disconnected")
+                            break
+                    except socket.timeout:
+                        pass  # No data received, continue
+                    
+                    # Get current position from IMU
+                    position = imu_reader.get_position()
+                    roll, pitch = imu_reader.get_angles()
+                    
+                    # Format message: "x,y,z"
+                    # Round to 3 decimal places for cleaner transmission
+                    x = round(position.x, 3)
+                    y = round(position.y, 3)
+                    z = round(position.z, 3)
+                    
+                    msg = f"{x},{y},{z}"
+                    
+                    # Send to Pico
+                    try:
+                        conn.sendall(msg.encode())
+                        
+                        # Display current state (update every 20 loops ≈ 1 second)
+                        if int(time.time() * UPDATE_RATE_HZ) % 20 == 0:
+                            print(f"Tilt: R={roll:+6.1f}° P={pitch:+6.1f}° | "
+                                  f"Sent: X={x:.3f}, Y={y:.3f}, Z={z:.3f}",
+                                  end='\r')
+                    
+                    except BrokenPipeError:
+                        print("\nClient disconnected (broken pipe)")
+                        break
+                    except Exception as e:
+                        print(f"\nError sending data: {e}")
+                        break
+                    
+                    # Sleep to maintain update rate
+                    time.sleep(1.0 / UPDATE_RATE_HZ)
+            
+            except KeyboardInterrupt:
+                print("\n\nShutting down...")
+            
+            finally:
+                imu_reader.stop()
+                print("Socket closed")
+
+
+def manual_mode():
+    """Original manual input mode (for testing without IMU)"""
+    print("=" * 70)
+    print("Manual Control Mode (No IMU)")
+    print("=" * 70)
+    print()
+    
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((HOST, PORT))
+        s.listen()
+        
+        print(f"Listening on {HOST}:{PORT}")
+        conn, addr = s.accept()
+        
+        with conn:
+            print(f"Connected by {addr}")
+            
+            while True:
+                data = conn.recv(1024)
+                if not data:
+                    print("Client disconnected")
+                    break
+                
+                # Manual input
+                x = input("Enter x coordinate: ")
+                y = input("Enter y coordinate: ")
+                z = input("Enter z coordinate: ")
+                
+                msg = f"{x},{y},{z}"
+                conn.sendall(msg.encode())
+                print(f"Sent: {msg}")
+
+
+if __name__ == "__main__":
+    main()
+    # manual_mode()
